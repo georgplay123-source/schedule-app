@@ -4,6 +4,12 @@ import numpy as np
 import re
 import requests
 import base64
+from io import BytesIO
+from datetime import datetime, date, time, timedelta
+from zoneinfo import ZoneInfo
+import uuid
+
+TZ = ZoneInfo("Europe/Berlin")
 
 st.set_page_config(page_title="Расписание", layout="wide")
 st.title("📅 Расписание")
@@ -29,7 +35,7 @@ def is_admin() -> bool:
     return st.session_state["admin_ok"]
 
 
-# -------------------- GitHub storage --------------------
+# -------------------- GitHub storage helpers --------------------
 def gh_headers():
     return {
         "Authorization": f"token {st.secrets['GITHUB_TOKEN']}",
@@ -62,7 +68,6 @@ def gh_put_file(repo: str, path: str, branch: str, content_bytes: bytes, message
     return r.json()
 
 def gh_raw_url(repo: str, branch: str, path: str) -> str:
-    # raw download URL for public repo file
     owner, name = repo.split("/", 1)
     return f"https://raw.githubusercontent.com/{owner}/{name}/{branch}/{path}"
 
@@ -73,6 +78,39 @@ def download_latest_xlsx(url: str) -> bytes:
         raise RuntimeError(f"Не удалось скачать общий файл ({r.status_code}).")
     return r.content
 
+@st.cache_data(ttl=60)
+def gh_get_latest_file_commit_datetime(repo: str, branch: str, path: str) -> datetime | None:
+    """
+    Возвращает datetime последнего коммита, который менял именно этот файл (в UTC), затем конвертируем в Europe/Berlin.
+    """
+    url = f"https://api.github.com/repos/{repo}/commits"
+    r = requests.get(
+        url,
+        headers=gh_headers(),
+        params={"path": path, "sha": branch, "per_page": 1},
+        timeout=30,
+    )
+    if r.status_code == 404:
+        return None
+    if r.status_code != 200:
+        raise RuntimeError(f"GitHub commits error {r.status_code}: {r.text}")
+
+    arr = r.json()
+    if not arr:
+        return None
+
+    # Обычно есть committer.date или author.date
+    commit = arr[0].get("commit", {})
+    committer = commit.get("committer", {}) or {}
+    author = commit.get("author", {}) or {}
+    dt_str = committer.get("date") or author.get("date")
+    if not dt_str:
+        return None
+
+    # ISO 8601 Z
+    dt_utc = datetime.fromisoformat(dt_str.replace("Z", "+00:00"))
+    return dt_utc
+
 
 # -------------------- Parsing helpers --------------------
 def _clean_str(x) -> str:
@@ -82,6 +120,7 @@ def _clean_str(x) -> str:
     return "" if s.lower() == "nan" else s
 
 
+# ---------- Формат 1: "недельный" (первые 3 колонки + блоки по 4) ----------
 def parse_weekly_blocks_format(xlsx_file, sheet=None) -> pd.DataFrame:
     raw = pd.read_excel(xlsx_file, header=None, sheet_name=sheet)
 
@@ -129,6 +168,7 @@ def parse_weekly_blocks_format(xlsx_file, sheet=None) -> pd.DataFrame:
     return out
 
 
+# ---------- Формат 2: "общий" ----------
 def parse_general_college_format(xlsx_file, sheet=None) -> pd.DataFrame:
     raw = pd.read_excel(xlsx_file, header=None, sheet_name=sheet)
 
@@ -238,29 +278,106 @@ def parse_all_sheets(xlsx_file) -> pd.DataFrame:
     return out
 
 
-# -------------------- UI: Admin upload / Public view --------------------
+# -------------------- ICS export --------------------
+def default_pair_times():
+    # Типовые времена. Можно поменять в сайдбаре.
+    return {
+        1: ("08:30", "10:00"),
+        2: ("10:10", "11:40"),
+        3: ("12:10", "13:40"),
+        4: ("13:50", "15:20"),
+        5: ("15:30", "17:00"),
+        6: ("17:10", "18:40"),
+        7: ("18:50", "20:20"),
+    }
+
+def parse_hhmm(s: str) -> time:
+    hh, mm = s.strip().split(":")
+    return time(int(hh), int(mm))
+
+def dt_local(d: date, t: time) -> datetime:
+    return datetime(d.year, d.month, d.day, t.hour, t.minute, tzinfo=TZ)
+
+def ics_escape(text: str) -> str:
+    # минимальный экранировщик для ICS
+    return (text or "").replace("\\", "\\\\").replace("\n", "\\n").replace(",", "\\,").replace(";", "\\;")
+
+def make_ics(df_view: pd.DataFrame, pair_time_map: dict[int, tuple[str, str]]) -> str:
+    now_utc = datetime.now(tz=ZoneInfo("UTC")).strftime("%Y%m%dT%H%M%SZ")
+    lines = [
+        "BEGIN:VCALENDAR",
+        "VERSION:2.0",
+        "PRODID:-//College Schedule//Streamlit//RU",
+        "CALSCALE:GREGORIAN",
+        "METHOD:PUBLISH",
+    ]
+
+    # Ожидаем, что df_view содержит: Дата(datetime64), Пара(int), Группа, Дисциплина, Преподаватель, Аудитория, Лист
+    for _, row in df_view.iterrows():
+        d = row["Дата"].date() if hasattr(row["Дата"], "date") else pd.to_datetime(row["Дата"]).date()
+        pair = int(row["Пара"])
+        start_s, end_s = pair_time_map.get(pair, ("08:00", "08:45"))
+        start_t = parse_hhmm(start_s)
+        end_t = parse_hhmm(end_s)
+
+        dtstart = dt_local(d, start_t).strftime("%Y%m%dT%H%M%S")
+        dtend = dt_local(d, end_t).strftime("%Y%m%dT%H%M%S")
+
+        summary = f"{row.get('Дисциплина','')}"
+        location = f"{row.get('Аудитория','')}".strip()
+
+        desc_parts = []
+        if row.get("Преподаватель"):
+            desc_parts.append(f"Преподаватель: {row.get('Преподаватель')}")
+        if row.get("Группа"):
+            desc_parts.append(f"Группа: {row.get('Группа')}")
+        if row.get("Лист"):
+            desc_parts.append(f"Лист: {row.get('Лист')}")
+        if location:
+            desc_parts.append(f"Аудитория: {location}")
+        description = "\n".join(desc_parts)
+
+        uid = str(uuid.uuid4()) + "@schedule-app"
+
+        lines.extend([
+            "BEGIN:VEVENT",
+            f"UID:{uid}",
+            f"DTSTAMP:{now_utc}",
+            f"DTSTART;TZID=Europe/Berlin:{dtstart}",
+            f"DTEND;TZID=Europe/Berlin:{dtend}",
+            f"SUMMARY:{ics_escape(summary)}",
+            f"DESCRIPTION:{ics_escape(description)}",
+        ])
+        if location:
+            lines.append(f"LOCATION:{ics_escape(location)}")
+        lines.append("END:VEVENT")
+
+    lines.append("END:VCALENDAR")
+    return "\r\n".join(lines)
+
+
+# -------------------- App logic --------------------
 admin_ok = is_admin()
 
 st.info(
-    "📌 Пользователям: просто откройте ссылку — расписание уже будет показано.\n"
-    "Админу: слева в панели введите пароль и загрузите новый Excel, чтобы обновить расписание для всех."
+    "📌 Пользователям: просто откройте ссылку — расписание показывается автоматически.\n"
+    "Админу: слева введите пароль и загрузите новый Excel, чтобы обновить расписание для всех."
 )
 
 repo = st.secrets.get("GITHUB_REPO", "")
 branch = st.secrets.get("GITHUB_BRANCH", "main")
 path = st.secrets.get("GITHUB_FILE_PATH", "data/latest.xlsx")
 
-if admin_ok:
-    st.sidebar.markdown("### 🧪 Диагностика GitHub")
-    if st.sidebar.button("Проверить доступ к репозиторию"):
-        r = requests.get(f"https://api.github.com/repos/{repo}", headers=gh_headers(), timeout=30)
-        st.sidebar.write("GET /repos status:", r.status_code)
-        st.sidebar.write(r.text[:500])
+# Показываем дату последнего обновления файла (по коммиту)
+try:
+    dt_utc = gh_get_latest_file_commit_datetime(repo, branch, path)
+    if dt_utc:
+        dt_local_show = dt_utc.astimezone(TZ)
+        st.caption("🕒 Обновлено: " + dt_local_show.strftime("%d.%m.%Y %H:%M"))
+except Exception:
+    # не критично
+    pass
 
-    if st.sidebar.button("Проверить ветку"):
-        r = requests.get(f"https://api.github.com/repos/{repo}/branches/{branch}", headers=gh_headers(), timeout=30)
-        st.sidebar.write("GET /branches status:", r.status_code)
-        st.sidebar.write(r.text[:500])
 if admin_ok:
     st.subheader("⬆️ Обновить расписание (видно всем по ссылке)")
     new_file = st.file_uploader("Загрузите новый Excel (.xlsx) для публикации", type=["xlsx"], key="admin_uploader")
@@ -274,7 +391,7 @@ if admin_ok:
                 content_bytes=content,
                 message="Update schedule (latest.xlsx) via Streamlit app"
             )
-            st.success("✅ Готово! Расписание обновлено. Обновите страницу у зрителей (F5).")
+            st.success("✅ Готово! Расписание обновлено.")
             st.cache_data.clear()
             st.rerun()
         except Exception as e:
@@ -282,11 +399,11 @@ if admin_ok:
 
 st.subheader("📄 Текущее расписание")
 
-# Загружаем общий файл из GitHub (если есть)
+# Загружаем общий файл из GitHub
 try:
     url = gh_raw_url(repo, branch, path)
     xlsx_bytes = download_latest_xlsx(url)
-    df = parse_all_sheets(pd.io.common.BytesIO(xlsx_bytes))
+    df = parse_all_sheets(BytesIO(xlsx_bytes))
 except Exception as e:
     st.warning("Пока нет опубликованного файла расписания или он недоступен.")
     st.caption(f"Детали: {e}")
@@ -294,8 +411,24 @@ except Exception as e:
 
 st.success(f"Записей: {len(df)} | Листов: {df['Лист'].nunique()}")
 
-# --- Filters ---
+# -------------------- Quick buttons: Today --------------------
+today_local = datetime.now(TZ).date()
+
+if "date_quick_mode" not in st.session_state:
+    st.session_state["date_quick_mode"] = "all"  # all | today
+
+cbtn1, cbtn2, cbtn3 = st.columns([1, 1, 6])
+if cbtn1.button("📍 Сегодня"):
+    st.session_state["date_quick_mode"] = "today"
+if cbtn2.button("♻️ Сброс"):
+    st.session_state["date_quick_mode"] = "all"
+
+if st.session_state["date_quick_mode"] == "today":
+    st.info(f"Показаны занятия только за сегодня: {today_local.strftime('%d.%m.%Y')}")
+
+# -------------------- Filters --------------------
 col1, col2, col3, col4 = st.columns([1, 1, 2, 2])
+
 mode = col1.selectbox("Режим", ["По преподавателю", "По группе", "Всё"])
 
 days = sorted([d for d in df["День"].unique().tolist() if d])
@@ -307,6 +440,11 @@ sheet_filter = col3.multiselect("Листы", options=sheets, default=sheets)
 query = col4.text_input("Поиск (фамилия / предмет / аудитория / группа)")
 
 view = df.copy()
+
+# применяем "Сегодня"
+if st.session_state["date_quick_mode"] == "today":
+    view = view[view["Дата"].dt.date == today_local]
+
 if day_filter:
     view = view[view["День"].isin(day_filter)]
 if sheet_filter:
@@ -331,6 +469,7 @@ elif mode == "По группе":
     group = st.selectbox("Группа", options=groups)
     view = view[view["Группа"] == group]
 
+# -------------------- Table --------------------
 show = view.copy()
 show["Дата"] = show["Дата"].dt.strftime("%d.%m.%Y")
 
@@ -340,6 +479,7 @@ st.dataframe(
     hide_index=True
 )
 
+# -------------------- By days --------------------
 st.subheader("🗓️ По дням")
 view2 = view.copy()
 view2["Дата_str"] = view2["Дата"].dt.strftime("%d.%m.%Y")
@@ -353,6 +493,31 @@ for (date_str, day), chunk in view2.groupby(["Дата_str", "День"], sort=F
                 f"{row['Дисциплина']} — {row['Преподаватель']} · ауд. {row['Аудитория']}"
             )
 
-csv = view.to_csv(index=False, encoding="utf-8-sig")
-st.download_button("⬇️ Скачать выбранное (CSV)", data=csv, file_name="schedule_filtered.csv", mime="text/csv")
+# -------------------- Downloads: CSV + ICS --------------------
+c1, c2 = st.columns([1, 1])
 
+csv = view.to_csv(index=False, encoding="utf-8-sig")
+c1.download_button("⬇️ Скачать выбранное (CSV)", data=csv, file_name="schedule_filtered.csv", mime="text/csv")
+
+with st.sidebar:
+    st.markdown("### 🗓️ Экспорт в календарь (.ics)")
+    st.caption("Время пар можно настроить под ваш колледж.")
+    pair_map = default_pair_times()
+    # показываем поля только для 1..7, можно расширить
+    for p in range(1, 8):
+        start_def, end_def = pair_map.get(p, ("08:00", "08:45"))
+        s = st.text_input(f"{p} пара — начало (HH:MM)", value=start_def, key=f"p{p}_s")
+        e = st.text_input(f"{p} пара — конец (HH:MM)", value=end_def, key=f"p{p}_e")
+        pair_map[p] = (s, e)
+
+# формируем ICS из ТЕКУЩЕГО view
+try:
+    ics_text = make_ics(view, pair_map)
+    c2.download_button(
+        "📅 Скачать календарь (ICS)",
+        data=ics_text.encode("utf-8"),
+        file_name="schedule.ics",
+        mime="text/calendar"
+    )
+except Exception as e:
+    c2.warning(f"Не удалось собрать ICS: {e}")
