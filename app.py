@@ -5,20 +5,48 @@ import re
 import requests
 import base64
 from io import BytesIO
-from datetime import datetime, date, time, timedelta
+from datetime import datetime, time
 from zoneinfo import ZoneInfo
 import uuid
 
 TZ = ZoneInfo("Europe/Berlin")
 
+# -------------------- Page --------------------
 st.set_page_config(page_title="Расписание", layout="wide")
 st.title("📅 Расписание")
 
-# -------------------- AUTH / ADMIN --------------------
+st.markdown("""
+<style>
+.block-container { padding-top: 1.1rem; padding-bottom: 2rem; max-width: 1200px; }
+.card {
+  border: 1px solid rgba(49, 51, 63, 0.20);
+  border-radius: 16px;
+  padding: 14px 16px;
+  margin-bottom: 10px;
+  background: rgba(255,255,255,0.02);
+}
+.card h4 { margin: 0 0 10px 0; font-size: 1.05rem; }
+.rowline { margin: 8px 0; line-height: 1.35; }
+.badge {
+  display:inline-block;
+  padding: 2px 9px;
+  border-radius: 999px;
+  border: 1px solid rgba(49, 51, 63, 0.25);
+  font-size: 0.82rem;
+  opacity: 0.92;
+}
+.muted { opacity: 0.78; }
+hr.soft { border: none; border-top: 1px solid rgba(49, 51, 63, 0.15); margin: 12px 0; }
+.smallcap { font-size: 0.88rem; opacity: 0.8; }
+</style>
+""", unsafe_allow_html=True)
+
+# -------------------- Admin auth --------------------
 def is_admin() -> bool:
     pwd = st.secrets.get("ADMIN_PASSWORD", "")
     if not pwd:
         return False
+
     if "admin_ok" not in st.session_state:
         st.session_state["admin_ok"] = False
 
@@ -34,13 +62,23 @@ def is_admin() -> bool:
 
     return st.session_state["admin_ok"]
 
-
-# -------------------- GitHub storage helpers --------------------
+# -------------------- GitHub helpers --------------------
 def gh_headers():
     return {
         "Authorization": f"token {st.secrets['GITHUB_TOKEN']}",
         "Accept": "application/vnd.github+json",
     }
+
+def gh_raw_url(repo: str, branch: str, path: str) -> str:
+    owner, name = repo.split("/", 1)
+    return f"https://raw.githubusercontent.com/{owner}/{name}/{branch}/{path}"
+
+@st.cache_data(ttl=60)
+def download_bytes(url: str) -> bytes:
+    r = requests.get(url, timeout=30)
+    if r.status_code != 200:
+        raise RuntimeError(f"Не удалось скачать файл ({r.status_code}).")
+    return r.content
 
 def gh_get_file_sha(repo: str, path: str, branch: str):
     url = f"https://api.github.com/repos/{repo}/contents/{path}"
@@ -67,22 +105,8 @@ def gh_put_file(repo: str, path: str, branch: str, content_bytes: bytes, message
         raise RuntimeError(f"GitHub write error {r.status_code}: {r.text}")
     return r.json()
 
-def gh_raw_url(repo: str, branch: str, path: str) -> str:
-    owner, name = repo.split("/", 1)
-    return f"https://raw.githubusercontent.com/{owner}/{name}/{branch}/{path}"
-
 @st.cache_data(ttl=60)
-def download_latest_xlsx(url: str) -> bytes:
-    r = requests.get(url, timeout=30)
-    if r.status_code != 200:
-        raise RuntimeError(f"Не удалось скачать общий файл ({r.status_code}).")
-    return r.content
-
-@st.cache_data(ttl=60)
-def gh_get_latest_file_commit_datetime(repo: str, branch: str, path: str) -> datetime | None:
-    """
-    Возвращает datetime последнего коммита, который менял именно этот файл (в UTC), затем конвертируем в Europe/Berlin.
-    """
+def gh_get_latest_file_commit_datetime(repo: str, branch: str, path: str):
     url = f"https://api.github.com/repos/{repo}/commits"
     r = requests.get(
         url,
@@ -99,7 +123,6 @@ def gh_get_latest_file_commit_datetime(repo: str, branch: str, path: str) -> dat
     if not arr:
         return None
 
-    # Обычно есть committer.date или author.date
     commit = arr[0].get("commit", {})
     committer = commit.get("committer", {}) or {}
     author = commit.get("author", {}) or {}
@@ -107,20 +130,129 @@ def gh_get_latest_file_commit_datetime(repo: str, branch: str, path: str) -> dat
     if not dt_str:
         return None
 
-    # ISO 8601 Z
     dt_utc = datetime.fromisoformat(dt_str.replace("Z", "+00:00"))
     return dt_utc
 
+# -------------------- Pair schedule (your rules) --------------------
+def get_pair_times_for_day(day_name: str) -> dict[int, tuple[str, str]]:
+    d = (day_name or "").strip().upper()
 
-# -------------------- Parsing helpers --------------------
+    monday = {
+        1: ("09:00", "10:10"),
+        2: ("10:20", "11:30"),
+        3: ("11:50", "13:00"),
+        4: ("13:10", "14:20"),
+        5: ("14:30", "15:30"),
+        6: ("16:00", "17:10"),
+        7: ("17:20", "18:30"),
+    }
+    tue_fri = {
+        1: ("09:00", "10:10"),
+        2: ("10:20", "11:30"),
+        3: ("11:50", "13:00"),
+        4: ("13:10", "14:20"),
+        5: ("14:30", "15:30"),
+        6: ("15:50", "17:00"),
+        7: ("17:10", "18:20"),
+    }
+    saturday = {
+        1: ("09:00", "10:00"),
+        2: ("10:10", "11:10"),
+        3: ("11:30", "12:30"),
+        4: ("12:40", "13:40"),
+        5: ("13:50", "14:50"),
+        6: ("15:00", "16:00"),
+        7: ("16:10", "17:10"),
+    }
+
+    if "ПОН" in d:
+        return monday
+    if "СУБ" in d:
+        return saturday
+    # Вт–Пт (и fallback)
+    return tue_fri
+
+def parse_hhmm(s: str) -> time:
+    hh, mm = s.strip().split(":")
+    return time(int(hh), int(mm))
+
+def dt_local(d: datetime.date, t: time) -> datetime:
+    return datetime(d.year, d.month, d.day, t.hour, t.minute, tzinfo=TZ)
+
+def ics_escape(text: str) -> str:
+    return (text or "").replace("\\", "\\\\").replace("\n", "\\n").replace(",", "\\,").replace(";", "\\;")
+
+def make_ics(df_view: pd.DataFrame) -> str:
+    now_utc = datetime.now(tz=ZoneInfo("UTC")).strftime("%Y%m%dT%H%M%SZ")
+    lines = [
+        "BEGIN:VCALENDAR",
+        "VERSION:2.0",
+        "PRODID:-//College Schedule//Streamlit//RU",
+        "CALSCALE:GREGORIAN",
+        "METHOD:PUBLISH",
+    ]
+
+    if df_view.empty:
+        lines.append("END:VCALENDAR")
+        return "\r\n".join(lines)
+
+    # Ensure types
+    tmp = df_view.copy()
+    tmp = tmp.sort_values(["Дата", "Пара", "Лист", "Группа"])
+
+    for _, row in tmp.iterrows():
+        d = row["Дата"].date() if hasattr(row["Дата"], "date") else pd.to_datetime(row["Дата"]).date()
+        day_name = str(row.get("День", "")).strip()
+        pair = int(row["Пара"])
+
+        pair_map = get_pair_times_for_day(day_name)
+        start_s, end_s = pair_map.get(pair, ("09:00", "10:00"))
+
+        start_t = parse_hhmm(start_s)
+        end_t = parse_hhmm(end_s)
+
+        dtstart = dt_local(d, start_t).strftime("%Y%m%dT%H%M%S")
+        dtend = dt_local(d, end_t).strftime("%Y%m%dT%H%M%S")
+
+        summary = f"{row.get('Дисциплина','')}"
+        location = f"{row.get('Аудитория','')}".strip()
+
+        desc_parts = []
+        if row.get("Преподаватель"):
+            desc_parts.append(f"Преподаватель: {row.get('Преподаватель')}")
+        if row.get("Группа"):
+            desc_parts.append(f"Группа: {row.get('Группа')}")
+        if row.get("Лист"):
+            desc_parts.append(f"Лист: {row.get('Лист')}")
+        if location:
+            desc_parts.append(f"Аудитория: {location}")
+        description = "\n".join(desc_parts)
+
+        uid = str(uuid.uuid4()) + "@schedule-app"
+
+        lines.extend([
+            "BEGIN:VEVENT",
+            f"UID:{uid}",
+            f"DTSTAMP:{now_utc}",
+            f"DTSTART;TZID=Europe/Berlin:{dtstart}",
+            f"DTEND;TZID=Europe/Berlin:{dtend}",
+            f"SUMMARY:{ics_escape(summary)}",
+            f"DESCRIPTION:{ics_escape(description)}",
+        ])
+        if location:
+            lines.append(f"LOCATION:{ics_escape(location)}")
+        lines.append("END:VEVENT")
+
+    lines.append("END:VCALENDAR")
+    return "\r\n".join(lines)
+
+# -------------------- Parsing (your formats) --------------------
 def _clean_str(x) -> str:
     if pd.isna(x):
         return ""
     s = str(x).strip()
     return "" if s.lower() == "nan" else s
 
-
-# ---------- Формат 1: "недельный" (первые 3 колонки + блоки по 4) ----------
 def parse_weekly_blocks_format(xlsx_file, sheet=None) -> pd.DataFrame:
     raw = pd.read_excel(xlsx_file, header=None, sheet_name=sheet)
 
@@ -167,8 +299,6 @@ def parse_weekly_blocks_format(xlsx_file, sheet=None) -> pd.DataFrame:
     out = out.sort_values(["Дата", "Пара", "Группа"]).reset_index(drop=True)
     return out
 
-
-# ---------- Формат 2: "общий" ----------
 def parse_general_college_format(xlsx_file, sheet=None) -> pd.DataFrame:
     raw = pd.read_excel(xlsx_file, header=None, sheet_name=sheet)
 
@@ -249,13 +379,11 @@ def parse_general_college_format(xlsx_file, sheet=None) -> pd.DataFrame:
     out = out.sort_values(["Дата", "Пара", "Группа"]).reset_index(drop=True)
     return out
 
-
 def parse_any_sheet(xlsx_file, sheet) -> pd.DataFrame:
     try:
         return parse_general_college_format(xlsx_file, sheet=sheet)
     except Exception:
         return parse_weekly_blocks_format(xlsx_file, sheet=sheet)
-
 
 def parse_all_sheets(xlsx_file) -> pd.DataFrame:
     xls = pd.ExcelFile(xlsx_file)
@@ -277,111 +405,78 @@ def parse_all_sheets(xlsx_file) -> pd.DataFrame:
     out = out.sort_values(["Дата", "Пара", "Лист", "Группа"]).reset_index(drop=True)
     return out
 
+# -------------------- Render helpers --------------------
+def render_day_cards(df_day: pd.DataFrame):
+    df_day = df_day.sort_values(["Дата", "Пара", "Лист", "Группа"])
+    df_day["Дата_str"] = df_day["Дата"].dt.strftime("%d.%m.%Y")
 
-# -------------------- ICS export --------------------
-def default_pair_times():
-    # Типовые времена. Можно поменять в сайдбаре.
-    return {
-        1: ("08:30", "10:00"),
-        2: ("10:10", "11:40"),
-        3: ("12:10", "13:40"),
-        4: ("13:50", "15:20"),
-        5: ("15:30", "17:00"),
-        6: ("17:10", "18:40"),
-        7: ("18:50", "20:20"),
-    }
+    for (date_str, day), chunk in df_day.groupby(["Дата_str", "День"], sort=False):
+        st.markdown(f"""
+        <div class="card">
+          <h4>🗓️ {date_str} <span class="muted">— {day}</span></h4>
+        """, unsafe_allow_html=True)
 
-def parse_hhmm(s: str) -> time:
-    hh, mm = s.strip().split(":")
-    return time(int(hh), int(mm))
+        last_pair = None
+        for _, row in chunk.iterrows():
+            pair = int(row["Пара"])
+            if last_pair is not None and pair != last_pair:
+                st.markdown('<hr class="soft" />', unsafe_allow_html=True)
+            last_pair = pair
 
-def dt_local(d: date, t: time) -> datetime:
-    return datetime(d.year, d.month, d.day, t.hour, t.minute, tzinfo=TZ)
+            pair_times = get_pair_times_for_day(day)
+            start_s, end_s = pair_times.get(pair, ("", ""))
+            time_part = f"{start_s}–{end_s}" if start_s else ""
 
-def ics_escape(text: str) -> str:
-    # минимальный экранировщик для ICS
-    return (text or "").replace("\\", "\\\\").replace("\n", "\\n").replace(",", "\\,").replace(";", "\\;")
+            st.markdown(
+                f"""
+                <div class="rowline">
+                  <span class="badge">{pair} пара</span>
+                  <span class="muted"> {time_part}</span>
+                  <span class="muted"> · </span>
+                  <b>{row.get('Лист','')}</b> / <b>{row.get('Группа','')}</b>
+                  <span class="muted"> · </span>
+                  {row.get('Дисциплина','')}
+                  <br/>
+                  <span class="muted">{row.get('Преподаватель','')}</span>
+                  <span class="muted"> · ауд.</span> {row.get('Аудитория','')}
+                </div>
+                """,
+                unsafe_allow_html=True
+            )
 
-def make_ics(df_view: pd.DataFrame, pair_time_map: dict[int, tuple[str, str]]) -> str:
-    now_utc = datetime.now(tz=ZoneInfo("UTC")).strftime("%Y%m%dT%H%M%SZ")
-    lines = [
-        "BEGIN:VCALENDAR",
-        "VERSION:2.0",
-        "PRODID:-//College Schedule//Streamlit//RU",
-        "CALSCALE:GREGORIAN",
-        "METHOD:PUBLISH",
-    ]
+        st.markdown("</div>", unsafe_allow_html=True)
 
-    # Ожидаем, что df_view содержит: Дата(datetime64), Пара(int), Группа, Дисциплина, Преподаватель, Аудитория, Лист
-    for _, row in df_view.iterrows():
-        d = row["Дата"].date() if hasattr(row["Дата"], "date") else pd.to_datetime(row["Дата"]).date()
-        pair = int(row["Пара"])
-        start_s, end_s = pair_time_map.get(pair, ("08:00", "08:45"))
-        start_t = parse_hhmm(start_s)
-        end_t = parse_hhmm(end_s)
-
-        dtstart = dt_local(d, start_t).strftime("%Y%m%dT%H%M%S")
-        dtend = dt_local(d, end_t).strftime("%Y%m%dT%H%M%S")
-
-        summary = f"{row.get('Дисциплина','')}"
-        location = f"{row.get('Аудитория','')}".strip()
-
-        desc_parts = []
-        if row.get("Преподаватель"):
-            desc_parts.append(f"Преподаватель: {row.get('Преподаватель')}")
-        if row.get("Группа"):
-            desc_parts.append(f"Группа: {row.get('Группа')}")
-        if row.get("Лист"):
-            desc_parts.append(f"Лист: {row.get('Лист')}")
-        if location:
-            desc_parts.append(f"Аудитория: {location}")
-        description = "\n".join(desc_parts)
-
-        uid = str(uuid.uuid4()) + "@schedule-app"
-
-        lines.extend([
-            "BEGIN:VEVENT",
-            f"UID:{uid}",
-            f"DTSTAMP:{now_utc}",
-            f"DTSTART;TZID=Europe/Berlin:{dtstart}",
-            f"DTEND;TZID=Europe/Berlin:{dtend}",
-            f"SUMMARY:{ics_escape(summary)}",
-            f"DESCRIPTION:{ics_escape(description)}",
-        ])
-        if location:
-            lines.append(f"LOCATION:{ics_escape(location)}")
-        lines.append("END:VEVENT")
-
-    lines.append("END:VCALENDAR")
-    return "\r\n".join(lines)
-
-
-# -------------------- App logic --------------------
+# -------------------- Main --------------------
 admin_ok = is_admin()
-
-st.info(
-    "📌 Пользователям: просто откройте ссылку — расписание показывается автоматически.\n"
-    "Админу: слева введите пароль и загрузите новый Excel, чтобы обновить расписание для всех."
-)
 
 repo = st.secrets.get("GITHUB_REPO", "")
 branch = st.secrets.get("GITHUB_BRANCH", "main")
 path = st.secrets.get("GITHUB_FILE_PATH", "data/latest.xlsx")
 
-# Показываем дату последнего обновления файла (по коммиту)
-try:
-    dt_utc = gh_get_latest_file_commit_datetime(repo, branch, path)
-    if dt_utc:
-        dt_local_show = dt_utc.astimezone(TZ)
-        st.caption("🕒 Обновлено: " + dt_local_show.strftime("%d.%m.%Y %H:%M"))
-except Exception:
-    # не критично
-    pass
+# Header info
+c_hdr1, c_hdr2 = st.columns([3, 2])
 
+with c_hdr1:
+    st.markdown('<div class="smallcap">Откройте ссылку — расписание уже будет показано. '
+                'Админ обновляет файл через панель слева.</div>', unsafe_allow_html=True)
+
+with c_hdr2:
+    try:
+        dt_utc = gh_get_latest_file_commit_datetime(repo, branch, path)
+        if dt_utc:
+            dt_local_show = dt_utc.astimezone(TZ)
+            st.markdown(
+                f'<div class="smallcap" style="text-align:right;">🕒 Обновлено: <b>{dt_local_show.strftime("%d.%m.%Y %H:%M")}</b></div>',
+                unsafe_allow_html=True
+            )
+    except Exception:
+        pass
+
+# Admin upload
 if admin_ok:
-    st.subheader("⬆️ Обновить расписание (видно всем по ссылке)")
-    new_file = st.file_uploader("Загрузите новый Excel (.xlsx) для публикации", type=["xlsx"], key="admin_uploader")
-    if new_file and st.button("Опубликовать"):
+    st.sidebar.markdown("### ⬆️ Обновить расписание")
+    new_file = st.sidebar.file_uploader("Загрузите Excel (.xlsx)", type=["xlsx"], key="admin_uploader")
+    if new_file and st.sidebar.button("Опубликовать"):
         try:
             content = new_file.getvalue()
             gh_put_file(
@@ -391,18 +486,18 @@ if admin_ok:
                 content_bytes=content,
                 message="Update schedule (latest.xlsx) via Streamlit app"
             )
-            st.success("✅ Готово! Расписание обновлено.")
+            st.sidebar.success("✅ Расписание обновлено!")
             st.cache_data.clear()
             st.rerun()
         except Exception as e:
-            st.error(f"Ошибка публикации: {e}")
+            st.sidebar.error(f"Ошибка публикации: {e}")
 
-st.subheader("📄 Текущее расписание")
+# Load published schedule
+st.markdown("### 📄 Текущее расписание")
 
-# Загружаем общий файл из GitHub
 try:
     url = gh_raw_url(repo, branch, path)
-    xlsx_bytes = download_latest_xlsx(url)
+    xlsx_bytes = download_bytes(url)
     df = parse_all_sheets(BytesIO(xlsx_bytes))
 except Exception as e:
     st.warning("Пока нет опубликованного файла расписания или он недоступен.")
@@ -411,24 +506,22 @@ except Exception as e:
 
 st.success(f"Записей: {len(df)} | Листов: {df['Лист'].nunique()}")
 
-# -------------------- Quick buttons: Today --------------------
+# Quick: Today
 today_local = datetime.now(TZ).date()
-
 if "date_quick_mode" not in st.session_state:
     st.session_state["date_quick_mode"] = "all"  # all | today
 
-cbtn1, cbtn2, cbtn3 = st.columns([1, 1, 6])
-if cbtn1.button("📍 Сегодня"):
+qb1, qb2, qb3 = st.columns([1.2, 1.0, 8.0])
+if qb1.button("📍 Сегодня"):
     st.session_state["date_quick_mode"] = "today"
-if cbtn2.button("♻️ Сброс"):
+if qb2.button("♻️ Сброс"):
     st.session_state["date_quick_mode"] = "all"
 
 if st.session_state["date_quick_mode"] == "today":
     st.info(f"Показаны занятия только за сегодня: {today_local.strftime('%d.%m.%Y')}")
 
-# -------------------- Filters --------------------
-col1, col2, col3, col4 = st.columns([1, 1, 2, 2])
-
+# Filters
+col1, col2, col3, col4 = st.columns([1.4, 1.7, 2.6, 2.6])
 mode = col1.selectbox("Режим", ["По преподавателю", "По группе", "Всё"])
 
 days = sorted([d for d in df["День"].unique().tolist() if d])
@@ -441,7 +534,6 @@ query = col4.text_input("Поиск (фамилия / предмет / ауди�
 
 view = df.copy()
 
-# применяем "Сегодня"
 if st.session_state["date_quick_mode"] == "today":
     view = view[view["Дата"].dt.date == today_local]
 
@@ -469,55 +561,71 @@ elif mode == "По группе":
     group = st.selectbox("Группа", options=groups)
     view = view[view["Группа"] == group]
 
-# -------------------- Table --------------------
-show = view.copy()
-show["Дата"] = show["Дата"].dt.strftime("%d.%m.%Y")
+# Tabs
+tab_days, tab_table, tab_cal = st.tabs(["📅 По дням", "📋 Таблица", "🗓️ Календарь"])
 
-st.dataframe(
-    show[["Лист", "Дата", "День", "Пара", "Группа", "Дисциплина", "Преподаватель", "Аудитория"]],
-    use_container_width=True,
-    hide_index=True
-)
+with tab_days:
+    if view.empty:
+        st.info("Ничего не найдено по выбранным фильтрам.")
+    else:
+        render_day_cards(view)
 
-# -------------------- By days --------------------
-st.subheader("🗓️ По дням")
-view2 = view.copy()
-view2["Дата_str"] = view2["Дата"].dt.strftime("%d.%m.%Y")
-view2 = view2.sort_values(["Дата", "Пара", "Лист", "Группа"])
+with tab_table:
+    show = view.copy()
+    show["Дата"] = show["Дата"].dt.strftime("%d.%m.%Y")
+    st.dataframe(
+        show[["Лист", "Дата", "День", "Пара", "Группа", "Дисциплина", "Преподаватель", "Аудитория"]],
+        use_container_width=True,
+        hide_index=True
+    )
 
-for (date_str, day), chunk in view2.groupby(["Дата_str", "День"], sort=False):
-    with st.expander(f"{date_str} — {day}", expanded=True):
-        for _, row in chunk.iterrows():
-            st.markdown(
-                f"**{int(row['Пара'])} пара** · **{row['Лист']} / {row['Группа']}** · "
-                f"{row['Дисциплина']} — {row['Преподаватель']} · ауд. {row['Аудитория']}"
-            )
+with tab_cal:
+    st.write("Скачайте календарь и импортируйте в Google Calendar / Outlook.")
+    st.caption("Экспорт учитывает текущие фильтры (например: только ваш преподаватель, только 'Сегодня', выбранные листы).")
 
-# -------------------- Downloads: CSV + ICS --------------------
-c1, c2 = st.columns([1, 1])
+    with st.expander("⏱️ Расписание пар (как используется в ICS)"):
+        st.markdown("""
+**Понедельник:**
+1) 09:00–10:10  
+2) 10:20–11:30  
+3) 11:50–13:00  
+4) 13:10–14:20  
+5) 14:30–15:30  
+6) 16:00–17:10  
+7) 17:20–18:30  
+
+**Вторник–Пятница:**
+1) 09:00–10:10  
+2) 10:20–11:30  
+3) 11:50–13:00  
+4) 13:10–14:20  
+5) 14:30–15:30  
+6) 15:50–17:00  
+7) 17:10–18:20  
+
+**Суббота:**
+1) 09:00–10:00  
+2) 10:10–11:10  
+3) 11:30–12:30  
+4) 12:40–13:40  
+5) 13:50–14:50  
+6) 15:00–16:00  
+7) 16:10–17:10
+        """)
+
+# Downloads
+d1, d2 = st.columns([1, 1])
 
 csv = view.to_csv(index=False, encoding="utf-8-sig")
-c1.download_button("⬇️ Скачать выбранное (CSV)", data=csv, file_name="schedule_filtered.csv", mime="text/csv")
+d1.download_button("⬇️ Скачать выбранное (CSV)", data=csv, file_name="schedule_filtered.csv", mime="text/csv")
 
-with st.sidebar:
-    st.markdown("### 🗓️ Экспорт в календарь (.ics)")
-    st.caption("Время пар можно настроить под ваш колледж.")
-    pair_map = default_pair_times()
-    # показываем поля только для 1..7, можно расширить
-    for p in range(1, 8):
-        start_def, end_def = pair_map.get(p, ("08:00", "08:45"))
-        s = st.text_input(f"{p} пара — начало (HH:MM)", value=start_def, key=f"p{p}_s")
-        e = st.text_input(f"{p} пара — конец (HH:MM)", value=end_def, key=f"p{p}_e")
-        pair_map[p] = (s, e)
-
-# формируем ICS из ТЕКУЩЕГО view
 try:
-    ics_text = make_ics(view, pair_map)
-    c2.download_button(
+    ics_text = make_ics(view)
+    d2.download_button(
         "📅 Скачать календарь (ICS)",
         data=ics_text.encode("utf-8"),
         file_name="schedule.ics",
         mime="text/calendar"
     )
 except Exception as e:
-    c2.warning(f"Не удалось собрать ICS: {e}")
+    d2.warning(f"Не удалось собрать ICS: {e}")
