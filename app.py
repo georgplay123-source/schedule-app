@@ -9,11 +9,12 @@ from datetime import datetime, time, timedelta
 from zoneinfo import ZoneInfo
 import uuid
 
-TZ = ZoneInfo("Europe/Berlin")
+# Изменено: Europe/Berlin -> Asia/Yekaterinburg (Екатеринбург, UTC+5)
+TZ = ZoneInfo("Asia/Yekaterinburg")
 
 # -------------------- Page --------------------
 st.set_page_config(page_title="Расписание", layout="wide")
-st.title("📅 Расписание")
+st.title("📅 Расписание колледжа")
 
 # ---------- simple mobile detection ----------
 def detect_mobile() -> bool:
@@ -242,8 +243,8 @@ def make_ics(df_view: pd.DataFrame) -> str:
             "BEGIN:VEVENT",
             f"UID:{uid}",
             f"DTSTAMP:{now_utc}",
-            f"DTSTART;TZID=Europe/Berlin:{dtstart}",
-            f"DTEND;TZID=Europe/Berlin:{dtend}",
+            f"DTSTART;TZID=Asia/Yekaterinburg:{dtstart}",
+            f"DTEND;TZID=Asia/Yekaterinburg:{dtend}",
             f"SUMMARY:{ics_escape(summary)}",
             f"DESCRIPTION:{ics_escape(description)}",
         ])
@@ -704,24 +705,27 @@ with b5:
         st.session_state["quick_mode"] = "all"
     st.markdown('</div>', unsafe_allow_html=True)
 
-# Filters
+# ============================================================
+# ИЗМЕНЕНИЯ ЗДЕСЬ: Убраны фильтры по группам с главной страницы
+# Теперь только поисковая строка и выбор режима
+# ============================================================
+
+# Упрощённые фильтры (только поиск и режим)
 if st.session_state["ui_mobile"]:
     col1, col2 = st.columns([1.2, 2.2])
     mode = col1.selectbox("Режим", ["Всё", "По преподавателю", "По группе"])
-    query = col2.text_input("Поиск (фамилия / предмет / ауд.)")
-    with st.expander("Фильтры (дни / группы)"):
-        days = sorted([d for d in df["День"].unique().tolist() if d])
-        day_filter = st.multiselect("Дни недели", options=days, default=[])
-        groups_all = sorted([g for g in df["Группа"].unique().tolist() if g])
-        group_filter = st.multiselect("Группы", options=groups_all, default=groups_all)
+    query = col2.text_input("🔍 Поиск (фамилия / предмет / ауд.)")
 else:
-    col1, col2, col3, col4 = st.columns([1.4, 1.7, 2.6, 2.6])
-    mode = col1.selectbox("Режим", ["По преподавателю", "По группе", "Всё"])
+    col1, col2 = st.columns([1.4, 3.6])
+    mode = col1.selectbox("Режим", ["Всё", "По преподавателю", "По группе"])
+    query = col2.text_input("🔍 Поиск (фамилия / предмет / аудитория / группа)")
+
+# Дни недели - вынесены в сайдбар (опционально, можно вообще убрать)
+with st.sidebar:
+    st.markdown("### 📅 Дни недели")
     days = sorted([d for d in df["День"].unique().tolist() if d])
-    day_filter = col2.multiselect("Дни недели", options=days, default=[])
-    groups_all = sorted([g for g in df["Группа"].unique().tolist() if g])
-    group_filter = col3.multiselect("Группы", options=groups_all, default=groups_all)
-    query = col4.text_input("Поиск (фамилия / предмет / аудитория / группа)")
+    day_filter = st.multiselect("Показать дни", options=days, default=days)
+    st.markdown("---")
 
 # Apply filters
 view = df.copy()
@@ -749,9 +753,7 @@ if qm in ("my_today", "my_tomorrow"):
 if 'day_filter' in locals() and day_filter:
     view = view[view["День"].isin(day_filter)]
 
-if 'group_filter' in locals() and group_filter:
-    view = view[view["Группа"].isin(group_filter)]
-
+# Поиск по всем полям
 if query.strip():
     q = query.strip().lower()
     mask = (
@@ -764,15 +766,16 @@ if query.strip():
     )
     view = view[mask]
 
+# Выбор по преподавателю или группе
 if mode == "По преподавателю":
     teachers = sorted([t for t in view["Преподаватель"].unique().tolist() if str(t).strip()])
     if teachers:
-        teacher = st.selectbox("Преподаватель", options=teachers)
+        teacher = st.selectbox("👨‍🏫 Выберите преподавателя", options=teachers)
         view = view[view["Преподаватель"] == teacher]
 elif mode == "По группе":
     groups = sorted([g for g in view["Группа"].unique().tolist() if str(g).strip()])
     if groups:
-        group = st.selectbox("Группа", options=groups)
+        group = st.selectbox("👥 Выберите группу", options=groups)
         view = view[view["Группа"] == group]
 
 # Tabs
@@ -801,8 +804,9 @@ with tab_table:
     )
 
 with tab_cal:
-    st.write("Скачайте календарь и импортируйте в Google Calendar / Outlook.")
+    st.write("📅 Скачайте календарь и импортируйте в Google Calendar / Outlook.")
     st.caption("Экспорт учитывает текущие фильтры, включая 'Мои пары сегодня/завтра'.")
+    st.caption(f"🕒 Часовой пояс: Екатеринбург (UTC+5)")
 
     with st.expander("⏱️ Расписание пар (используется в ICS)"):
         st.markdown("""
